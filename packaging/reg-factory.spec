@@ -41,6 +41,8 @@ datas = [
     (str(ROOT / "common" / "bundled_browser_helper.py"), "common"),
     (str(ROOT / "vendor" / "gopay_engine"), "vendor/gopay_engine"),
     (str(ROOT / "k12" / "static"), "k12/static"),
+    (str(ROOT / "vendor" / "reauth_web" / "LICENSE"), "vendor/reauth_web"),
+    (str(ROOT / "vendor" / "reauth_web" / "NOTICE"), "vendor/reauth_web"),
 ]
 datas.extend((str(ROOT / item), str(Path(item).parent)) for item in TASK_FILES)
 
@@ -83,7 +85,7 @@ hiddenimports = playwright_hidden + tls_hidden + [
     "k12.workspace",
 ]
 hiddenimports.extend(cloak_hidden)
-for package in ("common", "vision_solver", "xconsole_client"):
+for package in ("common", "vision_solver", "xconsole_client", "k12", "vendor.reauth_web"):
     hiddenimports.extend(collect_submodules(package))
 
 a = Analysis(

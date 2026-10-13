@@ -23,6 +23,7 @@ from common.account_records import (
     is_icloud_email,
     masked_email,
     parse_account_text,
+    reauthorize_account_record,
 )
 from common.browser import open_and_connect, teardown
 from common.mailbox import check_refresh_token, get_code_by_token, get_code_outlook_pw, prelogin_outlook
@@ -137,13 +138,31 @@ class MailCodeProvider:
                 f"falling back to browser ({validation.get('reason') or 'unknown'})"
             )
 
-        password = self.record.get("password") or ""
-        if not password:
+        passwords = []
+        for candidate in (
+            self.record.get("password"),
+            self.record.get("account_password"),
+            self.record.get("pickup_password"),
+        ):
+            candidate = str(candidate or "").strip()
+            if candidate and candidate not in passwords:
+                passwords.append(candidate)
+        if not passwords:
             raise RuntimeError("邮箱 Graph token 不可用且没有邮箱密码兜底")
-        self.mail_page = await self.context.new_page()
-        self.mail_prelogged = await prelogin_outlook(
-            self.mail_page, email, password, totp_secret=self.totp_secret
-        )
+        self.mail_prelogged = False
+        for index, password in enumerate(passwords):
+            self.mail_page = await self.context.new_page()
+            self.mail_prelogged = await prelogin_outlook(
+                self.mail_page, email, password, totp_secret=self.totp_secret
+            )
+            if self.mail_prelogged:
+                break
+            try:
+                await self.mail_page.close()
+            except Exception:
+                pass
+            if index + 1 < len(passwords):
+                print("  [mail] Outlook 主密码失败，尝试备用账号密码")
         if not self.mail_prelogged:
             raise RuntimeError("Outlook 邮箱密码登录失败，无法自动取 OpenAI 验证码")
         await self.main_page.bring_to_front()
@@ -247,7 +266,7 @@ def _result_path(value: str) -> Path:
 
 def _write_result(path: Path, result: dict):
     path.parent.mkdir(parents=True, exist_ok=True)
-    safe_result = {key: value for key, value in result.items() if key != "_output_token"}
+    safe_result = {key: value for key, value in result.items() if not key.startswith("_")}
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(safe_result, ensure_ascii=False) + "\n")
 
@@ -317,6 +336,16 @@ async def _run_k12_workspace(credentials: dict, result: dict, args) -> None:
 async def _save_and_create(origin, sub2api_token, group_id, credentials, email, result, args):
     if not credentials.get("refresh_token"):
         raise RuntimeError("OAuth 凭据缺少 refresh_token")
+    if getattr(args, "reimport", False):
+        fresh_email = str(credentials.get("email") or "").strip().lower()
+        if fresh_email != str(email or "").strip().lower():
+            raise RuntimeError("新 OAuth 凭据邮箱与重新导入的账号不一致，已中止更新")
+        plan = str(credentials.get("plan_type") or "").strip().lower()
+        if plan not in PAID_PLANS:
+            raise RuntimeError("重新授权仍未取得付费工作区凭据（套餐为 free 或未知），已中止更新旧账号")
+        workspace_id = str(getattr(args, "workspace_id", "") or "").strip()
+        if workspace_id and credentials.get("chatgpt_account_id") != workspace_id:
+            raise RuntimeError("新 OAuth 凭据不是指定的 Workspace，已中止更新旧账号")
     save_codex_oauth_credentials(credentials, email=credentials.get("email") or email)
     if getattr(args, "output_format", "none") == "sub2api":
         result["_output_token"] = _sub2api_token_content(credentials)
@@ -326,18 +355,20 @@ async def _save_and_create(origin, sub2api_token, group_id, credentials, email, 
         result["message"] = "OAuth credentials saved; SUB2API import skipped"
         return
     result["stage"] = "sub2api"
-    account = await asyncio.to_thread(
-        ox.create_oauth_account,
-        origin,
-        sub2api_token,
-        credentials,
-        [group_id],
-        credentials.get("email") or email or "codex-oauth",
-    )
+    if getattr(args, "reimport", False):
+        account = await asyncio.to_thread(
+            ox.update_oauth_account, origin, sub2api_token, credentials, email,
+            account_id=result.get("source_account_id"), source_name=result.get("_source_account_name") or "",
+        )
+    else:
+        account = await asyncio.to_thread(
+            ox.create_oauth_account, origin, sub2api_token, credentials, [group_id],
+            credentials.get("email") or email or "codex-oauth",
+        )
     result["sub2api_account_id"] = (account or {}).get("id")
     result["status"] = "success"
     result["stage"] = "done"
-    result["message"] = "手机号接码验证通过，SUB2API 导入成功"
+    result["message"] = "已重新授权并更新 SUB2API 账号凭据" if getattr(args, "reimport", False) else "手机号接码验证通过，SUB2API 导入成功"
 
 
 async def import_one(index, total, record, playwright, origin, sub2api_token, group_id, args):
@@ -359,6 +390,14 @@ async def import_one(index, total, record, playwright, origin, sub2api_token, gr
     browser_client = profile_id = None
     print(f"\n[{index}/{total}] {masked} 开始 Plus Codex 导入 ({result['source_type']})")
     try:
+        reimport = bool(getattr(args, "reimport", False))
+        if reimport:
+            # Never replay the free OAuth bundle from a historical export.
+            record = reauthorize_account_record(record)
+            result["source_account_id"] = record.get("sub2api_account_id")
+            result["_source_account_name"] = record.get("source_account_name") or ""
+            result["plan_type"] = ""
+            print("  [reimport] 重新登录获取工作区凭据，不复用导出中的旧 OAuth token")
         # A complete Codex credential bundle can only be imported when the
         # caller explicitly records that its phone verification already passed.
         if record.get("source_type") == "oauth_token":
@@ -421,11 +460,13 @@ async def import_one(index, total, record, playwright, origin, sub2api_token, gr
                 allow_phone=not getattr(args, "skip_phone", False),
                 totp_secret=record.get("two_factor") or "",
                 account_password=record.get("account_password") or "",
+                prefer_team=reimport,
+                workspace_id=str(getattr(args, "workspace_id", "") or ""),
             )
             if not code:
                 raise RuntimeError(message or "Codex OAuth 授权未完成")
 
-            result["phone_status"] = require_phone_verification(metadata, getattr(args, "skip_phone", False))
+            result["phone_status"] = require_phone_verification(metadata, getattr(args, "skip_phone", False) or reimport)
             result["stage"] = "exchange"
             exchanged = await asyncio.to_thread(
                 ox.exchange_code, origin, sub2api_token, session_id, code, state
@@ -487,6 +528,12 @@ async def run(args):
         raise RuntimeError(f"账号格式错误或重复：第 {lines} 行")
     if not records:
         raise RuntimeError("没有可导入的账号")
+    if not getattr(args, "reimport", False) and any(record.get("source_account_name") for record in records):
+        args.reimport = True
+        print("[reimport] 检测到 Sub2API 导出，自动启用重新授权更新模式")
+    if getattr(args, "reimport", False):
+        for record in records:
+            reauthorize_account_record(record)
     if args.dry_run:
         kinds = ", ".join(sorted({str(item.get("source_type") or "mailbox") for item in records}))
         print(f"[dry-run] 已解析 {len(records)} 个账号 ({kinds})，未登录、未接码、未导入")
@@ -498,7 +545,7 @@ async def run(args):
     os.environ["CODEX_SMS_TIMEOUT"] = str(args.sms_timeout)
     origin = _origin(SUB2API_URL)
     token = await asyncio.to_thread(ox.sub2api_login, origin, SUB2API_EMAIL, SUB2API_PASSWORD)
-    group_id = None if args.no_import else await asyncio.to_thread(
+    group_id = None if args.no_import or getattr(args, "reimport", False) else await asyncio.to_thread(
         ox.find_group_id, origin, token, args.group
     )
     print(
@@ -557,6 +604,10 @@ def build_parser():
                         help="不执行手机号验证；适合只保存凭据或导出 token")
     parser.add_argument("--no-import", action="store_true",
                         help="只保存或输出 OAuth 凭据，不创建 SUB2API 账号")
+    parser.add_argument("--reimport", action="store_true",
+                        help="重新登录，优先选择 Team 工作区，并原位更新已有 SUB2API 账号")
+    parser.add_argument("--workspace-id", default="",
+                        help="指定 OAuth 工作区；存在多个 Team 时必须指定")
     parser.add_argument("--invite-friend", action="store_true",
                         help="OAuth 成功后邀请新用户(从邮箱池抽未注册号),触发 banked reset 奖励")
     parser.add_argument("--invite-timeout", type=int, default=45,

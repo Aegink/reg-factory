@@ -23,6 +23,8 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
+from k12.reauth import ReauthService, create_router
+
 ROOT = Path(__file__).resolve().parents[1]
 _shared_data_root = Path(os.environ.get("REG_FACTORY_DATA_DIR") or ROOT).resolve()
 DATA_ROOT = Path(
@@ -47,6 +49,17 @@ PROCESSES: dict[str, asyncio.subprocess.Process] = {}
 CONFIG: dict[str, Any] = {}
 TASK_SEMAPHORE = asyncio.Semaphore(1)
 REFILL_TASK: asyncio.Task | None = None
+REAUTH_SERVICE: ReauthService | None = None
+
+
+def _reauth_service() -> ReauthService:
+    global REAUTH_SERVICE
+    if REAUTH_SERVICE is None:
+        REAUTH_SERVICE = ReauthService(DATA_ROOT / "reauth", lambda: CONFIG, _child_environment)
+    return REAUTH_SERVICE
+
+
+app.include_router(create_router(_reauth_service))
 
 
 def _now() -> str:
@@ -80,6 +93,9 @@ def _default_config() -> dict[str, Any]:
         "sub2api_email": os.environ.get("K12_SUB2API_EMAIL", os.environ.get("SUB2API_EMAIL", "")),
         "sub2api_password": os.environ.get("K12_SUB2API_PASSWORD", os.environ.get("SUB2API_PASSWORD", "")),
         "default_password": os.environ.get("K12_DEFAULT_PASSWORD", ""),
+        "reauth_proxy": os.environ.get("REAUTH_PROXY", ""),
+        "reauth_upstream_base": os.environ.get("REAUTH_UPSTREAM_BASE", ""),
+        "reauth_upstream_key": os.environ.get("REAUTH_UPSTREAM_KEY", ""),
     }
 
 
@@ -121,8 +137,12 @@ def _public_config() -> dict[str, Any]:
     public = dict(CONFIG)
     public.pop("sub2api_password", None)
     public.pop("default_password", None)
+    public.pop("reauth_proxy", None)
+    public.pop("reauth_upstream_key", None)
     public["sub2api_password_present"] = bool(CONFIG.get("sub2api_password"))
     public["default_password_present"] = bool(CONFIG.get("default_password"))
+    public["reauth_proxy_present"] = bool(CONFIG.get("reauth_proxy"))
+    public["reauth_upstream_key_present"] = bool(CONFIG.get("reauth_upstream_key"))
     return public
 
 
@@ -438,6 +458,8 @@ async def _run_task_limited(task_id: str, record_id: str) -> None:
 @app.on_event("startup")
 async def startup() -> None:
     global TASK_SEMAPHORE, REFILL_TASK
+    from config import _load_dotenv
+    _load_dotenv()
     _load_state()
     _configure_shared_email_pool()
     _refresh_shared_email_pool()
@@ -457,11 +479,15 @@ async def startup() -> None:
         await _persist()
     if CONFIG.get("auto_refill_enabled"):
         REFILL_TASK = asyncio.create_task(_refill_loop())
+    await _reauth_service().start()
 
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
-    global REFILL_TASK
+    global REFILL_TASK, REAUTH_SERVICE
+    if REAUTH_SERVICE is not None:
+        await REAUTH_SERVICE.close()
+        REAUTH_SERVICE = None
     if REFILL_TASK and not REFILL_TASK.done():
         REFILL_TASK.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -493,10 +519,16 @@ async def update_config(request: Request) -> dict[str, Any]:
     payload = await request.json()
     if not isinstance(payload, dict):
         return JSONResponse({"error": "config must be an object"}, status_code=400)
+    if "reauth_upstream_base" in payload:
+        from urllib.parse import urlparse
+        value = str(payload["reauth_upstream_base"] or "").strip().rstrip("/")
+        parsed = urlparse(value)
+        if value and (parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.username or parsed.password or parsed.query or parsed.fragment):
+            return JSONResponse({"error": "上游兑换地址必须是 HTTP(S) 地址，且不含账号、密码或查询参数"}, status_code=400)
     if "workspace_ids" in payload:
         from k12.workspace import workspace_ids
         CONFIG["workspace_ids"] = workspace_ids(payload["workspace_ids"])
-    for key in ("workspace_route", "group", "node", "sms_provider", "otp_mode", "sub2api_url", "sub2api_email", "network_mode", "network_node"):
+    for key in ("workspace_route", "group", "node", "sms_provider", "otp_mode", "sub2api_url", "sub2api_email", "network_mode", "network_node", "reauth_upstream_base"):
         if key in payload and payload[key] is not None:
             value = str(payload[key]).strip()
             if key == "otp_mode" and value not in {"auto", "manual"}:
@@ -524,6 +556,11 @@ async def update_config(request: Request) -> dict[str, Any]:
         CONFIG["sub2api_password"] = str(payload["sub2api_password"]).strip()
     if payload.get("default_password"):
         CONFIG["default_password"] = str(payload["default_password"]).strip()
+    for key in ("reauth_proxy", "reauth_upstream_key"):
+        if payload.get(key):
+            CONFIG[key] = str(payload[key]).strip()
+        if payload.get(f"clear_{key}"):
+            CONFIG[key] = ""
     TASK_SEMAPHORE = asyncio.Semaphore(max(1, min(5, int(CONFIG.get("concurrency") or 1))))
     if CONFIG.get("auto_refill_enabled") and (REFILL_TASK is None or REFILL_TASK.done()):
         REFILL_TASK = asyncio.create_task(_refill_loop())
@@ -900,7 +937,7 @@ async def import_data(request: Request) -> dict[str, Any]:
             continue
         TASKS[str(item["id"])] = dict(item)
     imported_config = bundle.get("config") if isinstance(bundle.get("config"), dict) else {}
-    for key in ("workspace_ids", "workspace_route", "run_workspace_join", "group", "concurrency", "timeout", "phone_attempts", "sms_timeout", "sms_provider", "otp_mode", "node", "network_mode", "network_node", "auto_refill_enabled", "refill_threshold", "refill_count", "refill_interval", "sub2api_url", "sub2api_email", "sub2api_password", "default_password"):
+    for key in ("workspace_ids", "workspace_route", "run_workspace_join", "group", "concurrency", "timeout", "phone_attempts", "sms_timeout", "sms_provider", "otp_mode", "node", "network_mode", "network_node", "auto_refill_enabled", "refill_threshold", "refill_count", "refill_interval", "sub2api_url", "sub2api_email", "sub2api_password", "default_password", "reauth_proxy", "reauth_upstream_base", "reauth_upstream_key"):
         if key in imported_config:
             CONFIG[key] = imported_config[key]
     await _persist()

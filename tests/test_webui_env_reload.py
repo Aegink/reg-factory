@@ -258,7 +258,7 @@ class WebUIEnvReloadTests(unittest.TestCase):
         path = self._env_file("unchanged")
 
         async def save():
-            with patch.object(server, "ENV_PATH", path):
+            with patch.object(server, "ENV_PATH", path), patch.object(server, "_apply_saved_env"):
                 with patch.object(server, "_proxy_panel_data", return_value={"config": {}}):
                     with patch("common.proxy_switch.ensure_proxy_mode", return_value="test-node"):
                         return await server.api_proxy_set(FakeJSONRequest({

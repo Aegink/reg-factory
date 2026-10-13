@@ -39,6 +39,8 @@ fi
 if [[ "$SKIP_TESTS" -eq 0 ]]; then
   "$PYTHON" -m unittest discover -s tests
   node --check webui/static/app.js
+  node --check k12/static/app.js
+  node --check k12/static/reauth.js
 fi
 
 rm -rf "$BUILD_ROOT" "$PYINSTALLER_OUTPUT" "$PACKAGE_ROOT"

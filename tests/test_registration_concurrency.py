@@ -188,7 +188,8 @@ class RegistrationConcurrencyTests(unittest.TestCase):
             return 0
 
         with patch.object(run_full_flow, "stage_emails", return_value=accounts), \
-                patch.object(run_full_flow, "stage_platforms", side_effect=capture):
+                patch.object(run_full_flow, "stage_platforms", side_effect=capture), \
+                patch.object(run_full_flow, "_cleanup_active_profiles"):
             results = run_full_flow.run_wave(args, env, 2)
 
         self.assertEqual({result[0] for result in results}, {0})

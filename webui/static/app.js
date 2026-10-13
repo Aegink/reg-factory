@@ -1641,6 +1641,8 @@ async function startPlusCodexImport(){
         keep_on_fail:$('#plus-keep-on-fail').checked,
         skip_phone:$('#plus-skip-phone').checked,
         no_import:$('#plus-no-import').checked,
+        reimport:$('#plus-reimport').checked,
+        workspace_id:$('#plus-workspace-id').value.trim(),
         output_format:$('#plus-output-format').value,
       }),
     });
@@ -1655,6 +1657,26 @@ async function startPlusCodexImport(){
     setPlusRunControls(false);
   }
 }
+
+$('#plus-account-file').onchange = async event=>{
+  const input = event.currentTarget;
+  const file = input.files?.[0];
+  if(!file) return;
+  try{
+    if(file.size > 5_000_000) throw new Error('批量账号内容超过 5 MB');
+    $('#plus-account-input').value = await file.text();
+    try{
+      const bundle = JSON.parse($('#plus-account-input').value);
+      if(Array.isArray(bundle.accounts)) $('#plus-reimport').checked = true;
+    }catch(_){ /* Text account files remain supported. */ }
+    $('#plus-account-file-name').textContent = file.name;
+    setPlusImportState(`已读取 ${file.name}，勾选“重新导入”后开始授权`, 'ok');
+  }catch(error){
+    setPlusImportState(`读取文件失败：${error.message || error}`, 'bad');
+  }finally{
+    input.value = '';
+  }
+};
 
 async function stopPlusCodexImport(){
   if(!plusRun) return;

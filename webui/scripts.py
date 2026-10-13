@@ -234,6 +234,8 @@ SCRIPTS = [
             {"flag": "--timeout", "type": "int", "default": 600, "help": "单账号 OAuth 超时秒数"},
             {"flag": "--skip-phone", "type": "bool", "default": False, "help": "跳过手机号/2FA 验证，仅保存或导出凭据"},
             {"flag": "--no-import", "type": "bool", "default": False, "help": "不创建 SUB2API 账号"},
+            {"flag": "--reimport", "type": "bool", "default": False, "help": "重新登录并原位更新已有 SUB2API 账号，优先 Team 工作区"},
+            {"flag": "--workspace-id", "type": "str", "default": "", "help": "重新导入时指定 Team Workspace ID"},
             {"flag": "--invite-friend", "type": "bool", "default": False,
              "help": "OAuth 成功后邀请新用户(从邮箱池抽未注册号)，仅 Plus/Pro 账号可见入口"},
             {"flag": "--invite-timeout", "type": "int", "default": 45, "help": "邀请流程超时秒数"},

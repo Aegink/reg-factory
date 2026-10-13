@@ -1585,7 +1585,7 @@ async def api_chatgpt_plus_import_codex(request: Request):
     if len(account_text) > 5_000_000:
         return JSONResponse({"error": "批量账号内容超过 5 MB"}, status_code=413)
 
-    from common.account_records import canonical_plus_account_line, parse_account_text
+    from common.account_records import canonical_plus_account_line, parse_account_text, reauthorize_account_record
 
     records, errors = parse_account_text(account_text, plus_credentials=True)
     if errors:
@@ -1619,6 +1619,19 @@ async def api_chatgpt_plus_import_codex(request: Request):
         return JSONResponse({"error": "未知手机号接码平台"}, status_code=400)
     skip_phone = bool((data or {}).get("skip_phone"))
     no_import = bool((data or {}).get("no_import"))
+    reimport = bool((data or {}).get("reimport"))
+    workspace_id = str((data or {}).get("workspace_id") or "").strip()[:200]
+    # Sub2API exports carry a historical OAuth grant plus mailbox notes. Such
+    # a grant may still be marked free after the account moved to Team, so the
+    # safe default for that format is to re-authorize and update in place.
+    if not reimport and any(record.get("source_account_name") for record in records):
+        reimport = True
+    if reimport:
+        try:
+            for record in records:
+                reauthorize_account_record(record)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
     output_format = str((data or {}).get("output_format") or "none").strip().lower()
     if output_format not in {"none", "sub2api"}:
         return JSONResponse({"error": "未知 token 输出格式"}, status_code=400)
@@ -1669,6 +1682,8 @@ async def api_chatgpt_plus_import_codex(request: Request):
             "--timeout": timeout,
             "--skip-phone": skip_phone,
             "--no-import": no_import,
+            "--reimport": reimport,
+            "--workspace-id": workspace_id,
             "--output-format": output_format,
             "--delete-input": True,
             "--keep-on-fail": bool((data or {}).get("keep_on_fail")),

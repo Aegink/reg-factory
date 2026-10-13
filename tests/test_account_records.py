@@ -10,6 +10,7 @@ from common.account_records import (
     masked_email,
     parse_account_line,
     parse_account_text,
+    reauthorize_account_record,
 )
 from tools.import_plus_codex import (
     _session_cookies,
@@ -21,6 +22,46 @@ from tools.import_plus_codex import (
 
 
 class AccountRecordTests(unittest.TestCase):
+    def test_sub2api_export_can_be_reauthorized_without_reusing_free_token(self):
+        export = {
+            "type": "sub2api-data",
+            "accounts": [{
+                "id": 42,
+                "name": "team@example.com----ChatPassword!----JBSWY3DPEHPK3PXP",
+                "credentials": {
+                    "access_token": "old-free-access",
+                    "refresh_token": "old-refresh",
+                    "email": "team@example.com",
+                    "plan_type": "free",
+                },
+                "notes": json.dumps({
+                    "mailbox": {
+                        "password": "mail-password",
+                        "client_id": "client-id",
+                        "refresh_token": "M.mail-refresh",
+                        "provider": "outlook",
+                    },
+                    "gpt": {"password": "ChatPassword!"},
+                    "two_factor": {"secret": "JBSWY3DPEHPK3PXP"},
+                }),
+            }],
+            "proxies": [],
+        }
+        records, errors = parse_account_text(json.dumps(export), plus_credentials=True)
+        self.assertFalse(errors)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["plan_type"], "free")
+        self.assertEqual(records[0]["sub2api_account_id"], "42")
+        refreshed = reauthorize_account_record(records[0])
+        self.assertEqual(refreshed["source_type"], "mailbox")
+        self.assertEqual(refreshed["password"], "mail-password")
+        self.assertEqual(refreshed["account_password"], "ChatPassword!")
+        self.assertEqual(refreshed["refresh_token"], "M.mail-refresh")
+        self.assertEqual(refreshed["two_factor"], "JBSWY3DPEHPK3PXP")
+        roundtrip, errors = parse_account_text(canonical_plus_account_line(records[0]), plus_credentials=True)
+        self.assertFalse(errors)
+        self.assertEqual(reauthorize_account_record(roundtrip[0]), refreshed)
+
     def test_claude_batch_import_accepts_custom_education_domain(self):
         import register
 
@@ -70,6 +111,7 @@ class AccountRecordTests(unittest.TestCase):
     def test_sub2api_output_is_separate_from_result_metadata(self):
         result = {
             "status": "success",
+            "_source_account_name": "email----private-password----private-2fa",
             "_output_token": _sub2api_token_content({
                 "access_token": "access-fixture",
                 "refresh_token": "refresh-fixture",
@@ -82,6 +124,7 @@ class AccountRecordTests(unittest.TestCase):
             _write_output_token(output_path, result)
             saved = json.loads(result_path.read_text(encoding="utf-8"))
             self.assertNotIn("_output_token", saved)
+            self.assertNotIn("private-password", json.dumps(saved))
             self.assertIn('"accessToken":"access-fixture"', output_path.read_text(encoding="utf-8"))
 
     def test_parses_refresh_token_before_client_id(self):

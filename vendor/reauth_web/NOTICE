@@ -1,0 +1,15 @@
+reauth-web integration
+
+Source: https://github.com/boji1334/reauth-web
+Revision: db8251817fd1baefc83c14c851135fb6078bc001
+License: MIT; see LICENSE. Copyright (c) 2026 boji1334.
+
+The protocol, parsing, TOTP, formats, jobs, cache, security, upstream and
+anonymous visit modules are retained under vendor/reauth_web. Imports use
+the local package namespace. Local changes validate conversion input,
+release protocol sessions, redact job errors and stop workers on shutdown.
+Redemption handles malformed inventory replies, exports only available
+accounts and serializes downloads to reuse cached exports. Conversion and
+regression tests use the local package namespace.
+Accounts within one reauthentication batch use the bounded worker pool.
+K12 supplies its own routes, lifecycle, configuration and frontend.

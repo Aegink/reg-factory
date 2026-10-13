@@ -105,6 +105,42 @@ def _nested(value: dict, *keys):
     return {}
 
 
+def _reauthorization_record(value: dict, email: str) -> dict:
+    """Keep mailbox credentials separate from the exported OpenAI refresh grant."""
+    saved = value.get("reauthorization")
+    if isinstance(saved, dict):
+        return saved
+    notes = value.get("notes") or {}
+    if isinstance(notes, str):
+        try:
+            notes = json.loads(notes)
+        except (TypeError, json.JSONDecodeError):
+            notes = {}
+    if not isinstance(notes, dict):
+        notes = {}
+    mailbox = _nested(notes, "mailbox")
+    gpt = _nested(notes, "gpt")
+    two_factor = _nested(notes, "two_factor")
+    name_fields = _split_fields(str(value.get("name") or ""))
+    card = name_fields if name_fields and name_fields[0].lower() == email.lower() else []
+    password = gpt.get("password") or value.get("account_password") or (card[1] if len(card) > 1 else "")
+    secret = two_factor.get("secret") or value.get("otp_secret") or value.get("two_factor") or (card[2] if len(card) > 2 and _looks_like_totp_secret(card[2]) else "")
+    if isinstance(secret, dict):
+        secret = secret.get("secret") or ""
+    if not (password or mailbox):
+        return {}
+    return {
+        "email": email,
+        "password": mailbox.get("password") or password,
+        "account_password": password,
+        "pickup_password": mailbox.get("pickup_password") or value.get("pickup_password") or "",
+        "refresh_token": mailbox.get("refresh_token") or "",
+        "client_id": mailbox.get("client_id") or "",
+        "provider": mailbox.get("provider") or "",
+        "two_factor": secret,
+    }
+
+
 def _from_mapping(value: dict) -> dict:
     credentials = _nested(value, "credentials", "oauth", "token")
     user = _nested(value, "user", "profile")
@@ -168,6 +204,7 @@ def _from_mapping(value: dict) -> dict:
         or value.get("planType")
         or account.get("plan_type")
         or account.get("planType")
+        or credentials.get("plan_type")
         or ""
     ).strip().lower()
     phone_status = str(
@@ -230,13 +267,23 @@ def _from_mapping(value: dict) -> dict:
                 "id_token": value.get("id_token") or value.get("idToken") or credentials.get("id_token") or credentials.get("idToken") or "",
                 "expires_at": value.get("expires_at") or value.get("expiresAt") or credentials.get("expires_at") or credentials.get("expiresAt") or "",
                 "email": email,
-                "chatgpt_account_id": value.get("chatgpt_account_id") or value.get("account_id") or "",
-                "chatgpt_user_id": value.get("chatgpt_user_id") or value.get("user_id") or "",
+                "chatgpt_account_id": value.get("chatgpt_account_id") or value.get("account_id") or credentials.get("chatgpt_account_id") or credentials.get("account_id") or "",
+                "chatgpt_user_id": value.get("chatgpt_user_id") or value.get("user_id") or credentials.get("chatgpt_user_id") or "",
+                "organization_id": value.get("organization_id") or credentials.get("organization_id") or "",
                 "plan_type": plan_type,
                 "client_id": client_id,
             }.items()
             if value not in (None, "", [])
         }
+    reauthorization = _reauthorization_record(value, email)
+    if reauthorization:
+        record["reauthorization"] = reauthorization
+    source_name = value.get("source_account_name") or (value.get("name") if credentials else "")
+    source_id = value.get("sub2api_account_id") or (value.get("id") if credentials else None)
+    if source_name:
+        record["source_account_name"] = str(source_name)
+    if source_id:
+        record["sub2api_account_id"] = str(source_id)
     return record
 
 
@@ -354,6 +401,15 @@ def _whole_json_records(text: str):
     except (TypeError, json.JSONDecodeError):
         return None
     if isinstance(value, dict):
+        if "accounts" in value:
+            accounts = value["accounts"]
+            if not isinstance(accounts, list) or not all(isinstance(item, dict) for item in accounts):
+                raise ValueError("JSON accounts must be an array of account objects")
+            openai_accounts = [
+                item for item in accounts
+                if str(item.get("platform") or "openai").strip().lower() == "openai"
+            ]
+            return [_validate(_from_mapping(item)) for item in openai_accounts]
         return [_validate(_from_mapping(value))]
     if isinstance(value, list):
         if value and all(isinstance(item, dict) and item.get("name") and item.get("value") for item in value):
@@ -449,6 +505,7 @@ def canonical_account_line(record: dict) -> str:
                 "source_type", "email", "password", "account_password", "refresh_token", "client_id",
                 "access_token", "session_token", "cookies", "plan_type", "codex_phone_status",
                 "mail_api_url", "mail_api_key", "two_factor",
+                "reauthorization", "source_account_name", "sub2api_account_id",
             )
             if record.get(key) not in (None, "", [], {})
         }
@@ -476,6 +533,22 @@ def canonical_account_line(record: dict) -> str:
     while len(fields) > 2 and not fields[-1]:
         fields.pop()
     return "----".join(fields)
+
+
+def reauthorize_account_record(record: dict) -> dict:
+    """Resolve a fresh login without treating an OpenAI RT as a mailbox RT."""
+    if record.get("source_type") not in {"oauth_token", "access_token"}:
+        return record
+    login = record.get("reauthorization")
+    if not isinstance(login, dict) or not login:
+        raise ValueError("重新授权需要邮箱登录资料；请提供邮箱密码/2FA，或包含 mailbox/gpt notes 的 Sub2API 导出")
+    fresh = _validate(_from_mapping(login))
+    if login.get("pickup_password"):
+        fresh["pickup_password"] = login["pickup_password"]
+    for key in ("source_account_name", "sub2api_account_id"):
+        if record.get(key):
+            fresh[key] = record[key]
+    return fresh
 
 
 def canonical_plus_account_line(record: dict) -> str:

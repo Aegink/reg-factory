@@ -52,11 +52,39 @@
         <div id="emails" class="list"></div>
       </article>
     </section>
+    <section class="panel reauth" aria-labelledby="reauth-title">
+      <div class="panel-head"><h2 id="reauth-title">协议重登与文件转换</h2><span id="reauth-meta">加载中</span></div>
+      <div class="reauth-tabs actions" role="group" aria-label="选择操作">
+        <button type="button" data-reauth-mode="reauth" aria-pressed="true">协议重登</button>
+        <button type="button" data-reauth-mode="convert" aria-pressed="false" class="secondary">本地转格式</button>
+        <button type="button" data-reauth-mode="redeem" aria-pressed="false" class="secondary">卡密兑换</button>
+      </div>
+      <p id="reauth-help" class="reauth-help">粘贴已有账号的邮箱、密码和 2FA 密钥，重新获取 Codex 凭据。</p>
+      <label id="reauth-account-label">账号（每行一个）<textarea id="reauth-accounts" autocomplete="off" spellcheck="false" placeholder="email----password----2fa&#10;也支持 | 分隔和 otpauth:// 密钥"></textarea></label>
+      <div id="reauth-convert-input" hidden>
+        <label>Sub2API JSON<textarea id="reauth-json" spellcheck="false" placeholder='{"accounts":[...]}'></textarea></label>
+        <label class="file-button secondary">读取 JSON 文件<input id="reauth-file" type="file" accept=".json,application/json" multiple></label>
+      </div>
+      <details class="reauth-settings">
+        <summary>重登与兑换设置</summary>
+        <label>重登专用代理（留空沿用已保存配置或 K12 网络出口）<input id="reauth-proxy" type="password" autocomplete="new-password" placeholder="http://user:pass@host:port 或 host:port:user:pass"></label>
+        <label class="check"><input id="reauth-clear-proxy" type="checkbox">清除专用代理，跟随 K12 网络出口</label>
+        <label>上游兑换地址<input id="reauth-upstream-base" type="url" placeholder="https://reauth-upstream.example"></label>
+        <label>上游兑换密钥<input id="reauth-upstream-key" type="password" autocomplete="new-password" placeholder="X-CPA-Server-Key"></label>
+        <label class="check"><input id="reauth-clear-key" type="checkbox">清除已保存的兑换密钥</label>
+        <div class="actions"><button id="reauth-save" type="button">保存设置</button></div>
+      </details>
+      <div class="actions reauth-actions"><button id="reauth-submit" type="button">开始重登</button><button id="reauth-refresh" type="button" class="secondary">刷新结果</button></div>
+      <p id="reauth-message" class="message" role="status" aria-live="polite"></p>
+      <div id="reauth-jobs" class="task-list"></div>
+      <details class="reauth-visits"><summary id="reauth-visits-summary">匿名访问统计</summary><div id="reauth-visits-days"></div></details>
+    </section>
     <section class="panel tasks">
       <div class="panel-head"><h2>任务队列</h2><div class="actions"><input id="task-count" type="number" min="1" value="1"><button id="start-tasks">启动任务</button><button id="check-at" class="secondary">AT 测活</button><button id="repair-at" class="secondary">修复失效 AT</button><button id="clear-failed" class="secondary">清理失败</button><button id="refresh-tasks" class="secondary">刷新</button></div></div>
       <div id="tasks" class="task-list"></div>
     </section>
   </main>
   <script src="/static/app.js"></script>
+  <script src="/static/reauth.js"></script>
 </body>
 </html>

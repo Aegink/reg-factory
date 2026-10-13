@@ -464,6 +464,9 @@ button:focus-visible,a:focus-visible,summary:focus-visible,input:focus-visible,s
 }
 .btn-secondary:hover{border-color:var(--accent);background:var(--accent-soft)}
 .btn-secondary:disabled{opacity:.45;cursor:wait}
+.visually-hidden-file{position:absolute;width:1px;height:1px;opacity:0;pointer-events:none}
+.plus-file-row{display:flex;align-items:center;gap:10px;margin:8px 0;color:var(--muted);font-size:12px}
+.plus-file-row label{cursor:pointer}
 .network-message{min-width:0;margin-left:4px;color:var(--muted);font-size:11px;overflow-wrap:anywhere}
 .network-message.ok{color:var(--green)}
 .network-message.bad{color:var(--red)}

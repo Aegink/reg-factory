@@ -38,6 +38,10 @@ if (-not $SkipTests) {
     if ($LASTEXITCODE -ne 0) { throw "Python tests failed." }
     & node --check webui/static/app.js
     if ($LASTEXITCODE -ne 0) { throw "WebUI JavaScript check failed." }
+    & node --check k12/static/app.js
+    if ($LASTEXITCODE -ne 0) { throw "K12 JavaScript check failed." }
+    & node --check k12/static/reauth.js
+    if ($LASTEXITCODE -ne 0) { throw "K12 reauth JavaScript check failed." }
 }
 
 foreach ($target in @($BuildRoot, $PyInstallerOutput, $PackageRoot, $ZipPath, $ChecksumPath)) {

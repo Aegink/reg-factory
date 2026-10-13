@@ -179,11 +179,16 @@
               </div>
               <div id="plus-protocol-note" class="plus-protocol-note">只处理命中免费 Plus 优惠的已授权账号；执行前会实时复检资格。</div>
             </div>
-            <label class="plus-field plus-field-wide">
+            <div class="plus-field plus-field-wide">
               <span>Plus 邮箱 / Cookie / OAuth Token（每行一个）</span>
+              <div class="plus-file-row">
+                <label class="btn-secondary" for="plus-account-file">选择 TXT / Sub2API JSON</label>
+                <input id="plus-account-file" class="visually-hidden-file" type="file" accept=".txt,.json,text/plain,application/json">
+                <span id="plus-account-file-name">也可以直接粘贴内容</span>
+              </div>
               <textarea id="plus-account-input" spellcheck="false" autocomplete="off"
                 placeholder="Plus 卡密: email----password----2fa_secret&#10;Outlook: email----password----refresh_token----client_id&#10;iCloud 三行: 邮箱&#10;接码 API URL&#10;2FA/API token&#10;Cookie: __Secure-next-auth.session-token=...&#10;OAuth JSON: {&quot;access_token&quot;:&quot;...&quot;,&quot;refresh_token&quot;:&quot;...&quot;,...}"></textarea>
-            </label>
+            </div>
             <div class="plus-controls">
               <label class="plus-field"><span>手机号接码平台</span><select id="plus-sms-provider"><option value="auto">自动切换</option><option value="custom">自定义号码池</option><option value="smsman">SMS-Man</option><option value="firefox">firefox.fun</option><option value="hero">Hero SMS</option></select></label>
               <label class="plus-field"><span>单账号换号次数</span><input id="plus-phone-attempts" type="number" min="1" max="10" value="3"></label>
@@ -192,6 +197,7 @@
               <label class="plus-field"><span>SUB2API 分组</span><input id="plus-group" type="text" value="codex"></label>
               <label class="plus-field"><span>Token 输出</span><select id="plus-output-format"><option value="none">不额外输出</option><option value="sub2api">SUB2API token JSON</option></select></label>
               <label class="plus-field"><span>ChatGPT 节点</span><input id="plus-node" type="text" value="auto"></label>
+              <label class="plus-field"><span>Team Workspace ID（重新导入可选）</span><input id="plus-workspace-id" type="text" placeholder="留空时自动选择唯一 Team"></label>
             </div>
             <details id="custom-sms-import" class="custom-sms-import">
               <summary>自定义号码池 <span id="custom-sms-summary">正在读取</span></summary>
@@ -207,6 +213,7 @@
             <label class="plus-toggle"><input id="plus-keep-on-fail" type="checkbox"><span>失败时保留浏览器</span></label>
             <label class="plus-toggle"><input id="plus-skip-phone" type="checkbox"><span>跳过手机号 / 2FA 验证</span></label>
             <label class="plus-toggle"><input id="plus-no-import" type="checkbox"><span>仅保存凭据，不导入 SUB2API</span></label>
+            <label class="plus-toggle"><input id="plus-reimport" type="checkbox"><span>重新导入：重新登录获取 Team 凭据并更新已有账号（旧 free 凭据不会复用）</span></label>
             <div class="plus-import-actions">
               <button id="btn-plus-import" class="btn-run" type="button">开始授权导入</button>
               <button id="btn-plus-protocol-run" class="btn-secondary" type="button">执行协议任务</button>

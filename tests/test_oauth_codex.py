@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import json
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -16,10 +18,85 @@ from common.oauth_codex import (
     _wait_for_phone_flow_exit,
     authorize_with_retry,
     handle_add_phone,
+    update_oauth_account,
+    _select_team_workspace,
+    build_oauth_credentials,
 )
 
 
 class OAuthCodexTests(unittest.TestCase):
+    def test_fresh_token_claims_replace_stale_free_plan_and_workspace(self):
+        claims = {"email": "person@example.com", "https://api.openai.com/auth": {
+            "chatgpt_account_id": "team-workspace", "chatgpt_plan_type": "team",
+        }}
+        payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+        fresh = build_oauth_credentials({
+            "access_token": "new-access", "id_token": f"header.{payload}.signature",
+            "plan_type": "free", "chatgpt_account_id": "personal-workspace",
+        })
+        self.assertEqual(fresh["plan_type"], "team")
+        self.assertEqual(fresh["chatgpt_account_id"], "team-workspace")
+
+    def test_access_claim_does_not_downgrade_exchange_plan(self):
+        claims = {"https://api.openai.com/auth": {"chatgpt_plan_type": "free"}}
+        payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+        fresh = build_oauth_credentials({
+            "access_token": f"header.{payload}.signature", "refresh_token": "rt", "plan_type": "team",
+        })
+        self.assertEqual(fresh["plan_type"], "team")
+
+    def test_workspace_selection_chooses_team_over_personal(self):
+        payload = base64.urlsafe_b64encode(json.dumps({"workspaces": [
+            {"id": "personal-id", "kind": "personal"},
+            {"id": "team-id", "kind": "team", "name": "Our Team"},
+        ]}).encode()).decode().rstrip("=")
+        page = MagicMock()
+        page.url = "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"
+        page.context.cookies = AsyncMock(return_value=[{"name": "oai-client-auth-session", "value": payload + ".signature"}])
+        page.evaluate = AsyncMock(return_value="/authorize/callback")
+        page.goto = AsyncMock()
+        self.assertTrue(asyncio.run(_select_team_workspace(page)))
+        self.assertEqual(page.evaluate.await_args.args[1], "team-id")
+        page.goto.assert_awaited_once()
+
+    def test_workspace_selection_rejects_ambiguous_teams(self):
+        payload = base64.urlsafe_b64encode(json.dumps({"workspaces": [
+            {"id": "team-one", "kind": "team"}, {"id": "team-two", "kind": "team"},
+        ]}).encode()).decode().rstrip("=")
+        page = MagicMock()
+        page.url = "https://auth.openai.com/workspace"
+        page.context.cookies = AsyncMock(return_value=[{"name": "oai-client-auth-session", "value": payload}])
+        with self.assertRaisesRegex(RuntimeError, "唯一 Team"):
+            asyncio.run(_select_team_workspace(page))
+        page.evaluate.assert_not_called()
+
+    def test_reimport_updates_existing_oauth_account_in_place(self):
+        existing = {
+            "id": "42",
+            "name": "person@example.com",
+            "platform": "openai",
+            "type": "oauth",
+            "credentials": {"email": "person@example.com", "plan_type": "free"},
+            "extra": {"email": "person@example.com"},
+            "concurrency": 10,
+            "priority": 1,
+            "rate_multiplier": 1,
+            "auto_pause_on_expired": True,
+        }
+        fresh = {"email": "person@example.com", "access_token": "new", "refresh_token": "new-rt", "plan_type": "team"}
+        with patch(
+            "common.oauth_codex._sub2api_request",
+            side_effect=[{"items": [existing], "total": 1}, {"id": "42", "credentials": fresh}],
+        ) as request:
+            result = update_oauth_account("https://sub2api.test", "admin", fresh, "person@example.com")
+        self.assertEqual(result["id"], "42")
+        self.assertEqual(request.call_count, 2)
+        update = request.call_args_list[1]
+        self.assertEqual(update.args[1], "/api/v1/admin/accounts/42")
+        self.assertEqual(update.kwargs["method"], "PUT")
+        self.assertEqual(update.kwargs["body"]["name"], "person@example.com")
+        self.assertEqual(update.kwargs["body"]["credentials"]["plan_type"], "team")
+
     def test_cpa_auth_url_extracts_nested_state(self):
         response = MagicMock(ok=True)
         response.json.return_value = {

@@ -25,7 +25,7 @@ import struct
 import sys
 import time
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs, urlencode
+from urllib.parse import urlparse, parse_qs, urlencode, quote
 
 import requests
 
@@ -240,6 +240,31 @@ def build_oauth_credentials(exchange_data):
             cred[k] = v
     if not cred.get("access_token"):
         raise RuntimeError("exchange-code 未返回 access_token")
+    # A fresh ID token can correct a stale plan/workspace in the exchange
+    # metadata. Match AsterGate's preference for ID claims, then access claims.
+    from common.session_export import parse_jwt_payload
+
+    identity = {}
+    for token_key in ("id_token", "access_token"):
+        claims = parse_jwt_payload(cred.get(token_key)) or {}
+        auth = claims.get("https://api.openai.com/auth") or {}
+        profile = claims.get("https://api.openai.com/profile") or {}
+        if not isinstance(auth, dict):
+            auth = {}
+        if not isinstance(profile, dict):
+            profile = {}
+        for key, value in {
+            "email": claims.get("email") or profile.get("email"),
+            "chatgpt_account_id": auth.get("chatgpt_account_id") or auth.get("account_id"),
+            "chatgpt_user_id": auth.get("chatgpt_user_id") or auth.get("user_id"),
+            "organization_id": auth.get("organization_id"),
+            "plan_type": auth.get("chatgpt_plan_type") or auth.get("plan_type"),
+        }.items():
+            if token_key == "access_token" and cred.get(key):
+                continue
+            if value and key not in identity:
+                identity[key] = value
+    cred.update(identity)
     return cred
 
 
@@ -265,6 +290,73 @@ def create_oauth_account(origin, token, credentials, group_ids, name="",
         payload["extra"] = extra
     return _sub2api_request(origin, "/api/v1/admin/accounts",
                             token=token, method="POST", body=payload, timeout=timeout)
+
+
+def update_oauth_account(origin, token, credentials, email, *,
+                         account_id=None, source_name="", timeout=60):
+    """Replace credentials on one existing account, preserving its settings."""
+    target_email = str(email or "").strip().lower()
+    if not target_email:
+        raise RuntimeError("重新导入缺少账号邮箱，无法匹配旧账号")
+    candidates = []
+    page = 1
+    while True:
+        data = _sub2api_request(
+            origin,
+            f"/api/v1/admin/accounts?page={page}&page_size=100&platform=openai&search={quote(target_email)}",
+            token=token, timeout=timeout,
+        ) or {}
+        if isinstance(data, list):
+            items = data
+            total = len(items)
+        else:
+            items = data.get("items") or []
+            total = int(data.get("total") or len(items))
+        for item in items:
+            auth_type = str(item.get("type") or item.get("auth_type") or "").strip().lower()
+            if str(item.get("platform") or "openai").strip().lower() != "openai" or auth_type != "oauth":
+                continue
+            old_credentials = item.get("credentials") or {}
+            extra = item.get("extra") or {}
+            old_email = str(old_credentials.get("email") or extra.get("email") or "").strip().lower()
+            name_email = str(item.get("name") or "").split("----", 1)[0].strip().lower()
+            if old_email == target_email or (not old_email and name_email == target_email):
+                candidates.append(item)
+        if not items or page * 100 >= total:
+            break
+        page += 1
+    if account_id is not None:
+        by_id = [item for item in candidates if str(item.get("id")) == str(account_id)]
+        if by_id:
+            candidates = by_id
+    elif source_name:
+        named = [item for item in candidates if item.get("name") == source_name]
+        if named:
+            candidates = named
+    if not candidates:
+        raise RuntimeError("SUB2API 未找到对应的已有 OAuth 账号；重新导入不会自动新建重复账号")
+    if len(candidates) != 1:
+        raise RuntimeError("SUB2API 存在多个同邮箱 OAuth 账号，请提供带账号 id 的导出以指定更新目标")
+    existing = candidates[0]
+    target_id = existing.get("id")
+    if not target_id:
+        raise RuntimeError("SUB2API 已有账号缺少 id，无法更新")
+    extra = dict(existing.get("extra") or {})
+    extra.update({key: credentials[key] for key in ("email", "plan_type") if credentials.get(key)})
+    # Keep the account's operational settings intact when upgrading a personal
+    # credential to Team. Sub2API accepts the same account shape as POST for
+    # this PUT, so include the fields that are present in its export.
+    update_payload = {
+        key: existing[key]
+        for key in ("name", "notes", "platform", "type", "concurrency", "priority", "rate_multiplier", "auto_pause_on_expired")
+        if key in existing
+    }
+    update_payload.update({"credentials": credentials, "extra": extra})
+    result = _sub2api_request(
+        origin, f"/api/v1/admin/accounts/{quote(str(target_id), safe='')}",
+        token=token, method="PUT", body=update_payload, timeout=timeout,
+    )
+    return {**existing, **(result if isinstance(result, dict) else {}), "id": target_id}
 
 
 # ============================================================ 浏览器驱动授权
@@ -739,11 +831,115 @@ async def _complete_authenticator_login(page, secret):
     return False, "OAuth 2FA 验证码提交后页面未推进"
 
 
+async def _select_team_workspace(page, workspace_id=""):
+    """Select an explicit workspace or the sole non-personal OAuth choice."""
+    path = urlparse(page.url).path.lower()
+    if not any(part in path for part in ("/workspace", "/organization", "/consent")):
+        return False
+    # The auth session cookie contains the authoritative workspace list. Use it
+    # first so a personal account can never win merely because it is rendered
+    # as the first card in the browser UI.
+    try:
+        cookies = await page.context.cookies("https://auth.openai.com")
+        session_cookie = next((item.get("value") for item in cookies
+                               if item.get("name") == "oai-client-auth-session"), "")
+        if session_cookie:
+            encoded = str(session_cookie).split(".", 1)[0]
+            payload = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode("utf-8"))
+            workspaces = payload.get("workspaces") if isinstance(payload, dict) else []
+            if isinstance(workspaces, list):
+                choices = []
+                for item in workspaces:
+                    if not isinstance(item, dict):
+                        continue
+                    item_id = str(item.get("id") or item.get("workspace_id") or item.get("organization_id") or "").strip()
+                    label = " ".join(str(item.get(key) or "") for key in ("name", "title", "kind", "type", "plan_type"))
+                    kind = str(item.get("kind") or item.get("type") or "").lower()
+                    is_personal = bool(re.search(r"\b(personal|default)\b|个人|個人", label, re.IGNORECASE))
+                    if item_id and kind not in {"personal", "default"} and not is_personal:
+                        choices.append((item_id, label))
+                if workspace_id:
+                    choices = [item for item in choices if item[0] == workspace_id]
+                if len(choices) == 1:
+                    selected = choices[0][0]
+                    next_url = await page.evaluate("""async (id) => {
+                      const response = await fetch('/api/accounts/workspace/select', {
+                        method: 'POST', credentials: 'include',
+                        headers: {'content-type': 'application/json'},
+                        body: JSON.stringify({workspace_id: id})
+                      });
+                      const data = await response.json().catch(() => ({}));
+                      if (!response.ok) throw new Error(`workspace/select HTTP ${response.status}`);
+                      return data.continue_url || data.page?.payload?.url || '';
+                    }""", selected)
+                    if not next_url:
+                        raise RuntimeError("workspace/select 响应缺少 continue_url")
+                    if str(next_url).startswith("/"):
+                        next_url = f"https://auth.openai.com{next_url}"
+                    await page.goto(next_url, timeout=30000, wait_until="domcontentloaded")
+                    print(f"  [workspace] 已选择 Team 工作区 {selected}")
+                    return True
+                if workspace_id or len(choices) > 1:
+                    raise RuntimeError("OAuth 未找到唯一 Team 工作区；请填写目标 Workspace ID")
+    except RuntimeError:
+        raise
+    except Exception:
+        # Fall back to the rendered page for older auth sessions without the
+        # workspace cookie format.
+        pass
+
+    on_workspace_page = any(part in page.url.lower() for part in ("/workspace", "/organization"))
+    choices = await page.evaluate("""(onWorkspacePage) => {
+      const choices = [];
+      document.querySelectorAll('select').forEach((select, index) => {
+        if (!select.getClientRects().length) return;
+        for (const option of select.options) {
+          if (option.disabled || !option.value) continue;
+          choices.push({kind: 'select', index, value: option.value, label: option.textContent.trim()});
+        }
+      });
+      const selector = 'input[type="radio"], [role="radio"], button[name="workspace_id"], button[name="organization_id"], button[data-workspace-id]';
+      document.querySelectorAll(selector).forEach((element, index) => {
+        const label = element.closest('label') || document.querySelector(`label[for="${element.id}"]`) || element.parentElement;
+        if (!(label || element).getClientRects().length) return;
+        choices.push({kind: 'radio', selector, index,
+          value: element.value || element.dataset.workspaceId || element.getAttribute('data-value') || '',
+          label: (label || element).textContent.trim()});
+      });
+      if (!choices.length && onWorkspacePage) {
+        document.querySelectorAll('button').forEach((button, index) => {
+          const label = button.textContent.trim();
+          if (!button.getClientRects().length || button.disabled || button.type === 'submit') return;
+          if (/^(continue|back|next|cancel|logout|log out|继续|繼續|返回|取消)$/i.test(label) || !label) return;
+          choices.push({kind: 'button', index, value: button.value || button.dataset.workspaceId || '', label});
+        });
+      }
+      return choices;
+    }""", on_workspace_page)
+    if not choices:
+        return False
+    if workspace_id:
+        eligible = [item for item in choices if item["value"] == workspace_id]
+    else:
+        eligible = [item for item in choices if not re.search(
+            r"\b(personal|default)\b|个人|個人", item["label"] + " " + item["value"], re.IGNORECASE
+        )]
+    if len(eligible) != 1:
+        raise RuntimeError("OAuth 未找到唯一 Team 工作区；请填写目标 Workspace ID，避免获取 personal/free 凭据")
+    choice = eligible[0]
+    if choice["kind"] == "select":
+        await page.locator("select").nth(choice["index"]).select_option(choice["value"])
+    else:
+        await page.locator(choice.get("selector") or "button").nth(choice["index"]).click(timeout=2500)
+    print("  [workspace] 已选择 Team 工作区")
+    return True
+
+
 async def drive_authorize(
     page, auth_url, timeout=120, debug_dump=None, account_email="",
     manual_phone=False, semi_phone="", allow_phone=True, sms_provider="auto",
     result_metadata=None, email_code_provider=None, totp_secret="",
-    account_password="",
+    account_password="", prefer_team=False, workspace_id="",
 ):
     """在已登录该账号的页面打开 auth_url，处理账号选择/同意页，捕获 localhost:1455 回调。
     manual_phone=True 时遇到 add-phone 不自动接码，由用户在浏览器手动填号收码，脚本轮询等待。
@@ -757,6 +953,7 @@ async def drive_authorize(
     auth_login_attempted = False
     authenticator_attempted = False
     phone_flow_seen = False
+    workspace_selected = False
 
     async def _handle(route):
         captured["url"] = route.request.url
@@ -849,6 +1046,11 @@ async def drive_authorize(
                         continue
             except Exception:
                 pass
+            if (prefer_team or workspace_id) and not workspace_selected:
+                try:
+                    workspace_selected = await _select_team_workspace(page, workspace_id)
+                except Exception as error:
+                    return None, None, f"OAuth 工作区选择失败: {str(error)[:160]}"
             # add-phone 页:manual_phone=True 时不接码，由用户在浏览器手动填号+输码(如 WhatsApp 码)，
             # 脚本只轮询等待离开 add-phone 页；否则走接码自动过。
             try:
@@ -1333,7 +1535,7 @@ async def authorize_with_retry(page, gen_auth_url, account_email="", phone_skip_
                                manual_phone=False, semi_phone="", reset_page=None,
                                sms_provider="auto", result_metadata=None,
                                email_code_provider=None, allow_phone=True,
-                               totp_secret="", account_password=""):
+                               totp_secret="", account_password="", prefer_team=False, workspace_id=""):
     """Codex 授权重试编排：**先赌 N 次"免手机直连"，每次失败重新生成授权链接(新会话=重新摇风控骰子)，
     实在每次都要手机，最后一次才真接码/手动填号。**
 
@@ -1390,7 +1592,7 @@ async def authorize_with_retry(page, gen_auth_url, account_email="", phone_skip_
                 account_email=account_email, manual_phone=manual_phone, semi_phone=semi_phone,
                 allow_phone=True, sms_provider=sms_provider, result_metadata=attempt_metadata,
                 email_code_provider=email_code_provider, totp_secret=totp_secret,
-                account_password=account_password)
+                account_password=account_password, prefer_team=prefer_team, workspace_id=workspace_id)
         else:
             print(f"  [codex] 授权尝试 {attempt+1}/{total}（免手机直连，弹手机就换会话重试，上限 {skip_timeout}s）...")
             _budget = skip_timeout
@@ -1400,7 +1602,7 @@ async def authorize_with_retry(page, gen_auth_url, account_email="", phone_skip_
                 account_email=account_email, allow_phone=False,
                 sms_provider=sms_provider, result_metadata=attempt_metadata,
                 email_code_provider=email_code_provider, totp_secret=totp_secret,
-                account_password=account_password)
+                account_password=account_password, prefer_team=prefer_team, workspace_id=workspace_id)
         # 硬上限：drive_authorize 内部循环若被卡死的 await 阻塞会无视自身 deadline，
         # 这里用 wait_for 兜底(+60s 缓冲)强制超时，避免整轮永久冻结。
         try:
